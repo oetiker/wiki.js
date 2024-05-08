@@ -143,27 +143,16 @@ module.exports = {
     if (_.includes(['sync', 'pull'], this.mode)) {
       const latestCommitLog = _.get(await this.git.log(['-n', '1', this.config.branch, '--']), 'latest', {})
 
-      const diff = await this.git.diffSummary(['-M', currentCommitLog.hash, latestCommitLog.hash])
-      if (_.get(diff, 'files', []).length > 0) {
-        let filesToProcess = []
-        const filePattern = /(.*?)(?:{(.*?))? => (?:(.*?)})?(.*)/
-        for (const f of diff.files) {
-          const fMatch = f.file.match(filePattern)
-          const fNames = {
-            old: null,
-            new: null
-          }
-          if (!fMatch) {
-            fNames.old = f.file
-            fNames.new = f.file
-          } else if (!fMatch[2] && !fMatch[3]) {
-            fNames.old = fMatch[1]
-            fNames.new = fMatch[4]
-          } else {
-            fNames.old = (fMatch[1] + fMatch[2] + fMatch[4]).replace('//', '/')
-            fNames.new = (fMatch[1] + fMatch[3] + fMatch[4]).replace('//', '/')
-          }
-          const fPath = path.join(this.repoPath, fNames.new)
+      const diff = await this.git.diff(['--name-status', '-M', currentCommitLog.hash, latestCommitLog.hash])
+      const lines = diff.split(/\r?\n/);
+      const filesToProcess = [];
+      for (const line of lines) {
+        const match = line.match(/^(\S)(\d{1,3})?\t(.[^\t]*)(?:\t(.[^\t]*))?$/);
+        if (match) {
+          const [, status, similarity, oldPath, newPath] = match;
+          const fName = newPath ?? oldPath;
+          const fPath = path.join(this.repoPath, fName)
+          const fLog = await this.git.log({ maxCount: 1, file: fPath });
           let fStats = { size: 0 }
           try {
             fStats = await fs.stat(fPath)
@@ -175,15 +164,17 @@ module.exports = {
           }
 
           filesToProcess.push({
-            ...f,
             file: {
               path: fPath,
               stats: fStats
             },
-            oldPath: fNames.old,
-            relPath: fNames.new
-          })
-        }
+            oldPath,
+            relPath: fName,
+            user: fLog.latest.author_email
+          });
+        } 
+      }
+      if (filesToProcess.length > 0) {
         await this.processFiles(filesToProcess, rootUser)
       }
     }
@@ -207,7 +198,7 @@ module.exports = {
           const contentPath = pageHelper.getPagePath(item.oldPath)
           const contentDestinationPath = pageHelper.getPagePath(item.relPath)
           await WIKI.models.pages.movePage({
-            user: user,
+            user: item.user ?? user,
             path: contentPath.path,
             destinationPath: contentDestinationPath.path,
             locale: contentPath.locale,
@@ -220,7 +211,7 @@ module.exports = {
 
           const contentPath = pageHelper.getPagePath(item.relPath)
           await WIKI.models.pages.deletePage({
-            user: user,
+            user: item.user ?? user,
             path: contentPath.path,
             locale: contentPath.locale,
             skipStorage: true
@@ -230,7 +221,7 @@ module.exports = {
 
         try {
           await commonDisk.processPage({
-            user,
+            user: item.user ?? user,
             relPath: item.relPath,
             fullPath: this.repoPath,
             contentType: contentType,
@@ -277,7 +268,7 @@ module.exports = {
 
         try {
           await commonDisk.processAsset({
-            user,
+            user: item.user ?? user,
             relPath: item.relPath,
             file: item.file,
             contentType: contentType,
@@ -450,8 +441,12 @@ module.exports = {
             return cb()
           } else if (relPath && relPath.length > 3) {
             WIKI.logger.info(`(STORAGE/GIT) Processing ${relPath}...`)
+            const fLog = await this.git.log({ 
+              maxCount: 1, 
+              file: file.path 
+            });
             await this.processFiles([{
-              user: rootUser,
+              user: fLog.latest.author_email ?? rootUser,
               relPath,
               file,
               deletions: 0,
